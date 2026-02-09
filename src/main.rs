@@ -482,3 +482,613 @@ fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::HashMapInsertUniqueExt;
+
+    const PRECISION: i64 = 10_000;
+    const PRECISION_U64: u64 = 10_000;
+
+    #[test]
+    fn insert_unique_returns_some_on_new_key() {
+        let mut map: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
+        let result = map.insert_unique(1, "value");
+        assert!(result.is_some());
+        assert_eq!(map.get(&1), Some(&"value"));
+    }
+
+    #[test]
+    fn insert_unique_returns_none_on_existing_key() {
+        let mut map: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
+        map.insert(1, "first");
+        let result = map.insert_unique(1, "second");
+        assert!(result.is_none());
+        assert_eq!(map.get(&1), Some(&"first")); // original value unchanged
+    }
+
+    #[test]
+    fn insert_unique_returns_mutable_reference() {
+        let mut map: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        let result = map.insert_unique(1, String::from("value"));
+        if let Some(v) = result {
+            v.push_str("_modified");
+        }
+        assert_eq!(map.get(&1), Some(&String::from("value_modified")));
+    }
+
+    fn try_run(
+        txs: Vec<super::Tx>,
+    ) -> anyhow::Result<(
+        std::collections::HashMap<u16, super::Account>,
+        std::collections::HashMap<u32, super::Deposit>,
+    )> {
+        let mut accounts = std::collections::HashMap::new();
+        let mut deposits = std::collections::HashMap::new();
+        let mut withdrawals: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for tx in txs {
+            super::process(&mut accounts, &mut deposits, &mut withdrawals, tx)?;
+        }
+        Ok((accounts, deposits))
+    }
+
+    fn run(
+        txs: Vec<super::Tx>,
+    ) -> (
+        std::collections::HashMap<u16, super::Account>,
+        std::collections::HashMap<u32, super::Deposit>,
+    ) {
+        try_run(txs).unwrap()
+    }
+
+    fn run_err(txs: Vec<super::Tx>) -> anyhow::Error {
+        match try_run(txs) {
+            Ok(_) => panic!("Expected transaction processing to fail"),
+            Err(e) => e,
+        }
+    }
+
+    fn deposit(account_id: u16, tx_id: u32, amount: i64) -> super::Tx {
+        super::Tx {
+            account_id,
+            action: super::TxAction::Deposit {
+                tx_id,
+                amount: amount as u64,
+            },
+        }
+    }
+
+    fn withdrawal(account_id: u16, tx_id: u32, amount: i64) -> super::Tx {
+        super::Tx {
+            account_id,
+            action: super::TxAction::Withdrawal {
+                tx_id,
+                amount: amount as u64,
+            },
+        }
+    }
+
+    fn dispute(account_id: u16, tx_id: u32) -> super::Tx {
+        super::Tx {
+            account_id,
+            action: super::TxAction::Dispute { tx_id },
+        }
+    }
+
+    fn resolve(account_id: u16, tx_id: u32) -> super::Tx {
+        super::Tx {
+            account_id,
+            action: super::TxAction::Resolve { tx_id },
+        }
+    }
+
+    fn chargeback(account_id: u16, tx_id: u32) -> super::Tx {
+        super::Tx {
+            account_id,
+            action: super::TxAction::Chargeback { tx_id },
+        }
+    }
+
+    #[test]
+    fn rejects_more_than_4_decimal_places() {
+        use std::str::FromStr;
+        assert!(super::decimal_to_u64(rust_decimal::Decimal::from_str("1.0000").unwrap()).is_ok());
+        assert!(
+            super::decimal_to_u64(rust_decimal::Decimal::from_str("1.00001").unwrap()).is_err()
+        );
+        assert!(
+            super::decimal_to_u64(rust_decimal::Decimal::from_str("1.12345").unwrap()).is_err()
+        );
+    }
+
+    // Deposit Tests
+
+    #[test]
+    fn deposit_increases_available_balance() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            deposit(1, 2, 50 * PRECISION),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 150 * PRECISION);
+    }
+
+    #[test]
+    fn no_deposit_when_locked() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            dispute(1, 1),
+            deposit(1, 2, 50 * PRECISION),
+            chargeback(1, 1),
+            deposit(1, 3, 51 * PRECISION),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 50 * PRECISION);
+        assert_eq!(acc.blocked_balance, 0);
+        assert!(acc.locked);
+    }
+
+    #[test]
+    fn duplicate_deposit_same_amount_is_idempotent() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            deposit(1, 1, 100 * PRECISION), // same amount - idempotent
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 100 * PRECISION);
+    }
+
+    #[test]
+    fn duplicate_deposit_different_amount_is_error() {
+        let result = try_run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            deposit(1, 1, 50 * PRECISION), // different amount - error
+        ]);
+        assert!(result.is_err());
+    }
+
+    // Withdrawal Tests
+
+    #[test]
+    fn withdrawal_decreases_available_balance() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            withdrawal(1, 2, 40 * PRECISION),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 60 * PRECISION);
+    }
+
+    #[test]
+    fn no_withdrawal_when_insufficient_balance() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 50 * PRECISION),
+            withdrawal(1, 2, 100 * PRECISION),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 50 * PRECISION);
+    }
+
+    #[test]
+    fn no_withdrawal_when_unknown_account() {
+        let (accounts, _) = run(vec![withdrawal(1, 1, 100 * PRECISION)]);
+        assert!(accounts.get(&1).is_none());
+    }
+
+    #[test]
+    fn no_withdrawal_on_locked_account() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            dispute(1, 1),
+            chargeback(1, 1),
+            withdrawal(1, 2, 50 * PRECISION),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert!(acc.locked);
+    }
+
+    #[test]
+    fn can_withdrawal_when_only_disputed() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            deposit(1, 2, 50 * PRECISION),
+            dispute(1, 1),
+            withdrawal(1, 3, 50 * PRECISION),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert_eq!(acc.blocked_balance, 100 * PRECISION_U64);
+    }
+
+    #[test]
+    fn duplicate_withdrawal_same_amount_is_idempotent() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            withdrawal(1, 2, 40 * PRECISION),
+            withdrawal(1, 2, 40 * PRECISION), // same amount - idempotent
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 60 * PRECISION);
+    }
+
+    #[test]
+    fn duplicate_withdrawal_different_amount_is_error() {
+        let result = try_run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            withdrawal(1, 2, 40 * PRECISION),
+            withdrawal(1, 2, 30 * PRECISION), // different amount - error
+        ]);
+        assert!(result.is_err());
+    }
+
+    // Dispute Tests
+
+    #[test]
+    fn dispute_moves_funds_to_blocked() {
+        let (accounts, _) = run(vec![deposit(1, 1, 100 * PRECISION), dispute(1, 1)]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert_eq!(acc.blocked_balance, 100 * PRECISION_U64);
+    }
+
+    #[test]
+    fn ignores_dispute_when_unkown_ref_id() {
+        let (accounts, _) = run(vec![deposit(1, 1, 100 * PRECISION), dispute(1, 999)]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 100 * PRECISION);
+        assert_eq!(acc.blocked_balance, 0);
+    }
+
+    #[test]
+    fn no_dispute_when_account_id_mismatch() {
+        let (accounts, _) = run(vec![deposit(1, 1, 100 * PRECISION), dispute(2, 1)]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 100 * PRECISION);
+        assert_eq!(acc.blocked_balance, 0);
+    }
+
+    #[test]
+    fn no_dispute_when_already_disputed() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            deposit(1, 2, 50 * PRECISION),
+            dispute(1, 1),
+            dispute(1, 1), // duplicate dispute
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 50 * PRECISION);
+        assert_eq!(acc.blocked_balance, 100 * PRECISION_U64);
+    }
+
+    #[test]
+    fn dispute_with_partial_withdrawal_creates_negative_balance() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            withdrawal(1, 2, 60 * PRECISION),
+            dispute(1, 1),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        // available = 40 - 100 = -60 (negative due to dispute)
+        assert_eq!(acc.available_balance, -60 * PRECISION);
+        assert_eq!(acc.blocked_balance, 100 * PRECISION_U64);
+    }
+
+    #[test]
+    fn no_dispute_on_locked_account() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            deposit(1, 2, 50 * PRECISION),
+            dispute(1, 1),
+            chargeback(1, 1),
+            dispute(1, 2),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 50 * PRECISION);
+        assert_eq!(acc.blocked_balance, 0);
+        assert!(acc.locked);
+    }
+
+    // Resolve Tests
+
+    #[test]
+    fn resolve_moves_funds_back_to_available() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            dispute(1, 1),
+            resolve(1, 1),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+
+        assert_eq!(acc.available_balance, 100 * PRECISION);
+        assert_eq!(acc.blocked_balance, 0);
+    }
+
+    #[test]
+    fn no_resolve_when_tx_not_found() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            dispute(1, 1),
+            resolve(1, 999),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert_eq!(acc.blocked_balance, 100 * PRECISION_U64);
+    }
+
+    #[test]
+    fn no_resolve_when_account_id_mismatch() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            dispute(1, 1),
+            resolve(2, 1),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert_eq!(acc.blocked_balance, 100 * PRECISION_U64);
+    }
+
+    #[test]
+    fn no_resolve_when_not_under_dispute() {
+        let (accounts, _) = run(vec![deposit(1, 1, 100 * PRECISION), resolve(1, 1)]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 100 * PRECISION);
+        assert_eq!(acc.blocked_balance, 0);
+    }
+
+    #[test]
+    fn no_resolve_on_locked_account() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            deposit(1, 2, 50 * PRECISION),
+            dispute(1, 1),
+            dispute(1, 2),
+            chargeback(1, 1),
+            resolve(1, 2),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert_eq!(acc.blocked_balance, 50 * PRECISION_U64);
+        assert!(acc.locked);
+    }
+
+    #[test]
+    fn double_resolve_is_noop() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            dispute(1, 1),
+            resolve(1, 1),
+            resolve(1, 1),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 100 * PRECISION);
+    }
+
+    // Chargeback Tests
+
+    #[test]
+    fn chargeback_removes_blocked_and_locks() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            dispute(1, 1),
+            chargeback(1, 1),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert_eq!(acc.blocked_balance, 0);
+        assert!(acc.locked);
+    }
+
+    #[test]
+    fn no_chargeback_when_tx_not_found() {
+        let (accounts, _) = run(vec![deposit(1, 1, 100 * PRECISION), chargeback(1, 999)]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 100 * PRECISION);
+        assert!(!acc.locked);
+    }
+
+    #[test]
+    fn no_chargeback_when_account_id_mismatch() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            dispute(1, 1),
+            chargeback(2, 1),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.blocked_balance, 100 * PRECISION_U64);
+        assert!(!acc.locked);
+    }
+
+    #[test]
+    fn no_chargeback_when_not_under_dispute() {
+        let (accounts, _) = run(vec![deposit(1, 1, 100 * PRECISION), chargeback(1, 1)]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 100 * PRECISION);
+        assert!(!acc.locked);
+    }
+
+    #[test]
+    fn no_chargeback_on_locked_account() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            deposit(1, 2, 50 * PRECISION),
+            dispute(1, 1),
+            dispute(1, 2),
+            chargeback(1, 1),
+            chargeback(1, 2),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert_eq!(acc.blocked_balance, 50 * PRECISION_U64);
+        assert!(acc.locked);
+    }
+
+    // Negative Balance Tests (disputes after partial withdrawal)
+
+    #[test]
+    fn dispute_allows_negative_available_balance() {
+        // User deposits 100, withdraws 60, then deposit is disputed
+        // Available should go negative: 40 - 100 = -60
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            withdrawal(1, 2, 60 * PRECISION),
+            dispute(1, 1),
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, -60 * PRECISION);
+        assert_eq!(acc.blocked_balance, 100 * PRECISION_U64);
+    }
+
+    #[test]
+    fn postponed_chargeback_scenario() {
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 10 * PRECISION),
+            withdrawal(1, 2, 5 * PRECISION),
+            dispute(1, 1),                // available = -5
+            deposit(1, 3, 5 * PRECISION), // available = 5
+            chargeback(1, 1),             // available = 0, blocked = 0, locked
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert_eq!(acc.blocked_balance, 0);
+        assert!(acc.locked);
+    }
+
+    #[test]
+    fn chargeback_fails_when_insufficient_funds() {
+        let err = run_err(vec![
+            deposit(1, 1, 100 * PRECISION),
+            withdrawal(1, 2, 80 * PRECISION),
+            dispute(1, 1),
+            chargeback(1, 1),
+        ]);
+        assert!(
+            err.to_string().contains("Insufficient funds"),
+            "Expected 'Insufficient funds' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_after_negative_available_restores_balance() {
+        // User deposits 100, withdraws 60, dispute (available=-60), then resolve
+        // After resolve: available = -60 + 100 = 40
+        let (accounts, _) = run(vec![
+            deposit(1, 1, 100 * PRECISION),
+            withdrawal(1, 2, 60 * PRECISION),
+            dispute(1, 1), // available = -60, held = 100
+            resolve(1, 1), // available =  40, held = 0
+        ]);
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 40 * PRECISION);
+        assert_eq!(acc.blocked_balance, 0);
+    }
+
+    fn load_fixture(name: &str) -> std::collections::HashMap<u16, super::Account> {
+        let path = format!("fixtures/{}.csv", name);
+        let file =
+            std::fs::File::open(&path).unwrap_or_else(|e| panic!("Failed to open {}: {}", path, e));
+        super::process_csv(file).unwrap_or_else(|e| panic!("Failed to process {}: {}", path, e))
+    }
+
+    fn load_fixture_err(name: &str) -> anyhow::Error {
+        let path = format!("fixtures/{}.csv", name);
+        let file =
+            std::fs::File::open(&path).unwrap_or_else(|e| panic!("Failed to open {}: {}", path, e));
+        match super::process_csv(file) {
+            Ok(_) => panic!("Expected fixture {} to fail", name),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn fixture_basic() {
+        let accounts = load_fixture("basic");
+
+        let acc1 = accounts.get(&1).unwrap();
+        assert_eq!(acc1.available_balance, 556001);
+        assert_eq!(acc1.blocked_balance, 0);
+        assert!(!acc1.locked);
+
+        let acc2 = accounts.get(&2).unwrap();
+        assert_eq!(acc2.available_balance, 1950200);
+        assert_eq!(acc2.blocked_balance, 0);
+        assert!(!acc2.locked);
+    }
+
+    #[test]
+    fn fixture_chargeback() {
+        let accounts = load_fixture("chargeback");
+
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 500000);
+        assert_eq!(acc.blocked_balance, 0);
+        assert!(acc.locked);
+    }
+
+    #[test]
+    fn fixture_insufficient_funds() {
+        let accounts = load_fixture("insufficient_funds");
+
+        let acc1 = accounts.get(&1).unwrap();
+        assert_eq!(acc1.available_balance, 500000);
+        assert!(!acc1.locked);
+
+        let acc2 = accounts.get(&2).unwrap();
+        assert_eq!(acc2.available_balance, 200000);
+        assert!(!acc2.locked);
+    }
+
+    #[test]
+    fn fixture_resolve() {
+        let accounts = load_fixture("resolve");
+
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 500000);
+        assert_eq!(acc.blocked_balance, 0);
+        assert!(!acc.locked);
+    }
+
+    #[test]
+    fn fixture_negative_balance() {
+        let err = load_fixture_err("negative_balance");
+        let err_chain = format!("{:?}", err);
+        assert!(
+            err_chain.contains("Insufficient funds"),
+            "Expected 'Insufficient funds' error, got: {}",
+            err_chain
+        );
+    }
+
+    #[test]
+    fn fixture_chargeback_no_funds() {
+        let err = load_fixture_err("chargeback_no_funds");
+        let err_chain = format!("{:?}", err);
+        assert!(
+            err_chain.contains("Insufficient funds"),
+            "Expected 'Insufficient funds' error, got: {}",
+            err_chain
+        );
+    }
+
+    #[test]
+    fn fixture_postponed_chargeback() {
+        let accounts = load_fixture("postponed_chargeback");
+
+        let acc = accounts.get(&1).unwrap();
+        assert_eq!(acc.available_balance, 0);
+        assert_eq!(acc.blocked_balance, 0);
+        assert!(acc.locked);
+    }
+
+    #[test]
+    fn fixture_whitespace_variations() {
+        let accounts = load_fixture("whitespace_variations");
+
+        let acc1 = accounts.get(&1).unwrap();
+        assert_eq!(acc1.available_balance, 750000);
+
+        let acc2 = accounts.get(&2).unwrap();
+        assert_eq!(acc2.available_balance, 505000);
+    }
+}
