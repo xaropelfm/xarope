@@ -24,7 +24,9 @@ trait HashMapInsertUniqueExt<K, V> {
     fn insert_unique(&mut self, key: K, value: V) -> Option<&mut V>;
 }
 
-impl<K: Eq + std::hash::Hash, V> HashMapInsertUniqueExt<K, V> for std::collections::HashMap<K, V> {
+impl<K: Eq + std::hash::Hash, V, S: std::hash::BuildHasher> HashMapInsertUniqueExt<K, V>
+    for std::collections::HashMap<K, V, S>
+{
     /// Inserts a key-value pair only if the key doesn't exist.
     /// Returns Some(&mut value) on success, None if key already existed.
     fn insert_unique(&mut self, key: K, value: V) -> Option<&mut V> {
@@ -124,9 +126,9 @@ struct Tx {
 }
 
 fn process(
-    accounts: &mut std::collections::HashMap<u16, Account>,
-    deposits: &mut std::collections::HashMap<u32, Deposit>,
-    withdrawals: &mut std::collections::HashMap<u32, u64>,
+    accounts: &mut rustc_hash::FxHashMap<u16, Account>,
+    deposits: &mut rustc_hash::FxHashMap<u32, Deposit>,
+    withdrawals: &mut rustc_hash::FxHashMap<u32, u64>,
     tx: Tx,
 ) -> anyhow::Result<()> {
     let account_id = tx.account_id;
@@ -369,16 +371,14 @@ fn process(
     Ok(())
 }
 
-fn process_csv<R: std::io::Read>(
-    reader: R,
-) -> anyhow::Result<std::collections::HashMap<u16, Account>> {
+fn process_csv<R: std::io::Read>(reader: R) -> anyhow::Result<rustc_hash::FxHashMap<u16, Account>> {
     let mut rdr = csv::ReaderBuilder::new()
         .trim(csv::Trim::None)
         .from_reader(reader);
 
-    let mut accounts: std::collections::HashMap<u16, Account> = std::collections::HashMap::new();
-    let mut deposits: std::collections::HashMap<u32, Deposit> = std::collections::HashMap::new();
-    let mut withdrawals: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    let mut accounts: rustc_hash::FxHashMap<u16, Account> = rustc_hash::FxHashMap::default();
+    let mut deposits: rustc_hash::FxHashMap<u32, Deposit> = rustc_hash::FxHashMap::default();
+    let mut withdrawals: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
 
     for (line_num, result) in rdr.records().enumerate() {
         let line = line_num + 2; // +1 for 0-index, +1 for header
@@ -458,7 +458,7 @@ fn process_csv<R: std::io::Read>(
 }
 
 fn write_accounts_csv<W: std::io::Write>(
-    accounts: std::collections::HashMap<u16, Account>,
+    accounts: rustc_hash::FxHashMap<u16, Account>,
     writer: W,
 ) -> anyhow::Result<()> {
     let mut wtr = csv::Writer::from_writer(writer);
@@ -556,12 +556,12 @@ mod tests {
     fn try_run(
         txs: Vec<super::Tx>,
     ) -> anyhow::Result<(
-        std::collections::HashMap<u16, super::Account>,
-        std::collections::HashMap<u32, super::Deposit>,
+        rustc_hash::FxHashMap<u16, super::Account>,
+        rustc_hash::FxHashMap<u32, super::Deposit>,
     )> {
-        let mut accounts = std::collections::HashMap::new();
-        let mut deposits = std::collections::HashMap::new();
-        let mut withdrawals: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut accounts = rustc_hash::FxHashMap::default();
+        let mut deposits = rustc_hash::FxHashMap::default();
+        let mut withdrawals: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
         for tx in txs {
             super::process(&mut accounts, &mut deposits, &mut withdrawals, tx)?;
         }
@@ -571,8 +571,8 @@ mod tests {
     fn run(
         txs: Vec<super::Tx>,
     ) -> (
-        std::collections::HashMap<u16, super::Account>,
-        std::collections::HashMap<u32, super::Deposit>,
+        rustc_hash::FxHashMap<u16, super::Account>,
+        rustc_hash::FxHashMap<u32, super::Deposit>,
     ) {
         try_run(txs).unwrap()
     }
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(acc.blocked_balance, 0);
     }
 
-    fn load_fixture(name: &str) -> std::collections::HashMap<u16, super::Account> {
+    fn load_fixture(name: &str) -> rustc_hash::FxHashMap<u16, super::Account> {
         let path = format!("fixtures/{}.csv", name);
         let file =
             std::fs::File::open(&path).unwrap_or_else(|e| panic!("Failed to open {}: {}", path, e));
