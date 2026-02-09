@@ -1,5 +1,7 @@
 use anyhow::Context;
 
+use rust_decimal::prelude::ToPrimitive;
+
 trait HashMapInsertUniqueExt<K, V> {
     fn insert_unique(&mut self, key: K, value: V) -> Option<&mut V>;
 }
@@ -13,6 +15,70 @@ impl<K: Eq + std::hash::Hash, V> HashMapInsertUniqueExt<K, V> for std::collectio
             std::collections::hash_map::Entry::Occupied(_) => None,
         }
     }
+}
+
+const SCALE: u32 = 4;
+const PRECISION: u64 = 10_u64.pow(SCALE);
+
+// code does not compile with if consts are not what we expect :)
+const _: () = assert!(SCALE == 4, "SCALE must be exactly 4 decimal places");
+const _: () = assert!(PRECISION == 10_000, "PRECISION must be exactly 10_000");
+
+fn decimal_to_u64(d: rust_decimal::Decimal) -> anyhow::Result<u64> {
+    if d.scale() > SCALE {
+        anyhow::bail!("Amount has more than {} decimal places: {}", SCALE, d);
+    }
+
+    let scaled = d
+        .checked_mul(rust_decimal::Decimal::from(PRECISION))
+        .context("Multiplication overflow in decimal_to_u64")?;
+
+    scaled.to_u64().context("Amount out of range for u64")
+}
+
+fn u64_to_decimal(n: u64) -> anyhow::Result<rust_decimal::Decimal> {
+    rust_decimal::Decimal::from(n)
+        .checked_div(rust_decimal::Decimal::from(PRECISION))
+        .context("Division failed in u64_to_decimal")
+}
+
+fn i64_to_decimal(n: i64) -> anyhow::Result<rust_decimal::Decimal> {
+    rust_decimal::Decimal::from(n)
+        // todo, avoid casting with as
+        .checked_div(rust_decimal::Decimal::from(PRECISION as i64))
+        .context("Division failed in i64_to_decimal")
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TxKind {
+    Deposit,
+    Withdrawal,
+    Dispute,
+    Resolve,
+    Chargeback,
+}
+
+#[derive(serde::Deserialize)]
+struct TxRecord {
+    #[serde(rename = "type")]
+    kind: TxKind,
+    client: u16,
+    tx: u32,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    amount: Option<rust_decimal::Decimal>,
+}
+
+#[derive(serde::Serialize)]
+struct ClientRow {
+    client: u16,
+    #[serde(with = "rust_decimal::serde::str")]
+    available: rust_decimal::Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    held: rust_decimal::Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    total: rust_decimal::Decimal,
+    locked: bool,
 }
 
 struct Account {
@@ -286,6 +352,98 @@ fn process(
             acc.locked = true;
         }
     }
+    Ok(())
+}
+
+fn process_csv<R: std::io::Read>(
+    reader: R,
+) -> anyhow::Result<std::collections::HashMap<u16, Account>> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(reader);
+
+    let mut accounts: std::collections::HashMap<u16, Account> = std::collections::HashMap::new();
+    let mut deposits: std::collections::HashMap<u32, Deposit> = std::collections::HashMap::new();
+    let mut withdrawals: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+
+    for (line_num, result) in rdr.deserialize().enumerate() {
+        let line = line_num + 2; // +1 for 0-index, +1 for header
+        let record: TxRecord = result.with_context(|| format!("Failed to parse row {}", line))?;
+
+        let tx = match record.kind {
+            TxKind::Deposit => {
+                let amount_dec = record
+                    .amount
+                    .with_context(|| format!("Deposit missing amount at line {}", line))?;
+                let amount = decimal_to_u64(amount_dec)
+                    .with_context(|| format!("Invalid deposit amount at line {}", line))?;
+                Tx {
+                    account_id: record.client,
+                    action: TxAction::Deposit {
+                        tx_id: record.tx,
+                        amount,
+                    },
+                }
+            }
+            TxKind::Withdrawal => {
+                let amount_dec = record
+                    .amount
+                    .with_context(|| format!("Withdrawal missing amount at line {}", line))?;
+                let amount = decimal_to_u64(amount_dec)
+                    .with_context(|| format!("Invalid withdrawal amount at line {}", line))?;
+                Tx {
+                    account_id: record.client,
+                    action: TxAction::Withdrawal {
+                        tx_id: record.tx,
+                        amount,
+                    },
+                }
+            }
+            TxKind::Dispute => Tx {
+                account_id: record.client,
+                action: TxAction::Dispute { tx_id: record.tx },
+            },
+            TxKind::Resolve => Tx {
+                account_id: record.client,
+                action: TxAction::Resolve { tx_id: record.tx },
+            },
+            TxKind::Chargeback => Tx {
+                account_id: record.client,
+                action: TxAction::Chargeback { tx_id: record.tx },
+            },
+        };
+
+        process(&mut accounts, &mut deposits, &mut withdrawals, tx)
+            .with_context(|| format!("Failed to process transaction at line {}", line))?;
+    }
+
+    Ok(accounts)
+}
+
+fn write_accounts_csv<W: std::io::Write>(
+    accounts: std::collections::HashMap<u16, Account>,
+    writer: W,
+) -> anyhow::Result<()> {
+    let mut wtr = csv::Writer::from_writer(writer);
+
+    for (client_id, account) in accounts {
+        let blocked_i64 =
+            i64::try_from(account.blocked_balance).context("Blocked balance too large for i64")?;
+        let total = account
+            .available_balance
+            .checked_add(blocked_i64)
+            .context("Total balance overflow")?;
+        let row = ClientRow {
+            client: client_id,
+            available: i64_to_decimal(account.available_balance)?,
+            held: u64_to_decimal(account.blocked_balance)?,
+            total: i64_to_decimal(total)?,
+            locked: account.locked,
+        };
+        wtr.serialize(row).context("Failed to write record")?;
+    }
+
+    wtr.flush().context("Failed to flush CSV writer")?;
     Ok(())
 }
 
