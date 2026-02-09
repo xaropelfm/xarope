@@ -20,6 +20,45 @@ const _: () = assert!(COL_CLIENT == 1, "COL_CLIENT must be 1");
 const _: () = assert!(COL_TX == 2, "COL_TX must be 2");
 const _: () = assert!(COL_AMOUNT == 3, "COL_AMOUNT must be 3");
 
+#[inline(always)]
+fn parse_field<T: std::str::FromStr>(
+    record: &csv::ByteRecord,
+    col: usize,
+    line: usize,
+) -> anyhow::Result<T>
+where
+    T::Err: Into<anyhow::Error>,
+{
+    std::str::from_utf8(
+        record
+            .get(col)
+            .with_context(|| format!("Missing col {}", col))?,
+    )?
+    .trim()
+    .parse()
+    .map_err(Into::into)
+    .with_context(|| format!("Invalid col {} at line {}", col, line))
+}
+
+#[inline(always)]
+fn parse_optional_decimal(
+    record: &csv::ByteRecord,
+    col: usize,
+    line: usize,
+) -> anyhow::Result<Option<rust_decimal::Decimal>> {
+    let Some(bytes) = record.get(col) else {
+        return Ok(None);
+    };
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    std::str::from_utf8(bytes)?
+        .trim()
+        .parse()
+        .map(Some)
+        .with_context(|| format!("Invalid amount at line {}", line))
+}
+
 trait HashMapInsertUniqueExt<K, V> {
     fn insert_unique(&mut self, key: K, value: V) -> Option<&mut V>;
 }
@@ -380,40 +419,18 @@ fn process_csv<R: std::io::Read>(reader: R) -> anyhow::Result<rustc_hash::FxHash
     let mut deposits: rustc_hash::FxHashMap<u32, Deposit> = rustc_hash::FxHashMap::default();
     let mut withdrawals: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
 
-    for (line_num, result) in rdr.records().enumerate() {
-        let line = line_num + 2; // +1 for 0-index, +1 for header
-        let record = result.with_context(|| format!("Failed to parse row {}", line))?;
+    let mut record = csv::ByteRecord::new();
+    let mut line: usize = 1; // header is line 1
+    while rdr
+        .read_byte_record(&mut record)
+        .with_context(|| format!("Failed to parse row {}", line))?
+    {
+        line += 1;
 
-        let kind: TxKind = record
-            .get(COL_TYPE)
-            .with_context(|| format!("Missing type field at line {}", line))?
-            .trim()
-            .parse()
-            .with_context(|| format!("Invalid transaction type at line {}", line))?;
-        let client: u16 = record
-            .get(COL_CLIENT)
-            .with_context(|| format!("Missing client field at line {}", line))?
-            .trim()
-            .parse()
-            .with_context(|| format!("Invalid client ID at line {}", line))?;
-        let tx_id: u32 = record
-            .get(COL_TX)
-            .with_context(|| format!("Missing tx field at line {}", line))?
-            .trim()
-            .parse()
-            .with_context(|| format!("Invalid transaction ID at line {}", line))?;
-
-        let amount: Option<rust_decimal::Decimal> = {
-            let s = record.get(COL_AMOUNT).unwrap_or("").trim();
-            if s.is_empty() {
-                None
-            } else {
-                Some(
-                    s.parse()
-                        .with_context(|| format!("Invalid amount at line {}", line))?,
-                )
-            }
-        };
+        let kind: TxKind = parse_field(&record, COL_TYPE, line)?;
+        let client: u16 = parse_field(&record, COL_CLIENT, line)?;
+        let tx_id: u32 = parse_field(&record, COL_TX, line)?;
+        let amount = parse_optional_decimal(&record, COL_AMOUNT, line)?;
 
         let tx = match kind {
             TxKind::Deposit => {
