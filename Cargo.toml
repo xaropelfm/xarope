@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = { version = "1", default-features = false, features = ["std"] }
+csv = { version = "1", default-features = false }
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"] }
+rust_decimal = { version = "1", default-features = false, features = ["serde-with-str", "std"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
