@@ -3,6 +3,23 @@ mod generator;
 use anyhow::Context;
 use rust_decimal::prelude::ToPrimitive;
 
+const SCALE: u32 = 4;
+const PRECISION: u64 = 10_u64.pow(SCALE);
+
+// CSV column indices: type,client,tx,amount
+const COL_TYPE: usize = 0;
+const COL_CLIENT: usize = 1;
+const COL_TX: usize = 2;
+const COL_AMOUNT: usize = 3;
+
+// code does not compile with if consts are not what we expect :)
+const _: () = assert!(SCALE == 4, "SCALE must be exactly 4 decimal places");
+const _: () = assert!(PRECISION == 10_000, "PRECISION must be exactly 10_000");
+const _: () = assert!(COL_TYPE == 0, "COL_TYPE must be 0");
+const _: () = assert!(COL_CLIENT == 1, "COL_CLIENT must be 1");
+const _: () = assert!(COL_TX == 2, "COL_TX must be 2");
+const _: () = assert!(COL_AMOUNT == 3, "COL_AMOUNT must be 3");
+
 trait HashMapInsertUniqueExt<K, V> {
     fn insert_unique(&mut self, key: K, value: V) -> Option<&mut V>;
 }
@@ -17,13 +34,6 @@ impl<K: Eq + std::hash::Hash, V> HashMapInsertUniqueExt<K, V> for std::collectio
         }
     }
 }
-
-const SCALE: u32 = 4;
-const PRECISION: u64 = 10_u64.pow(SCALE);
-
-// code does not compile with if consts are not what we expect :)
-const _: () = assert!(SCALE == 4, "SCALE must be exactly 4 decimal places");
-const _: () = assert!(PRECISION == 10_000, "PRECISION must be exactly 10_000");
 
 fn decimal_to_u64(d: rust_decimal::Decimal) -> anyhow::Result<u64> {
     if d.scale() > SCALE {
@@ -50,8 +60,6 @@ fn i64_to_decimal(n: i64) -> anyhow::Result<rust_decimal::Decimal> {
         .context("Division failed in i64_to_decimal")
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
 enum TxKind {
     Deposit,
     Withdrawal,
@@ -60,14 +68,19 @@ enum TxKind {
     Chargeback,
 }
 
-#[derive(serde::Deserialize)]
-struct TxRecord {
-    #[serde(rename = "type")]
-    kind: TxKind,
-    client: u16,
-    tx: u32,
-    #[serde(default, with = "rust_decimal::serde::str_option")]
-    amount: Option<rust_decimal::Decimal>,
+impl std::str::FromStr for TxKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "deposit" => Ok(TxKind::Deposit),
+            "withdrawal" => Ok(TxKind::Withdrawal),
+            "dispute" => Ok(TxKind::Dispute),
+            "resolve" => Ok(TxKind::Resolve),
+            "chargeback" => Ok(TxKind::Chargeback),
+            _ => anyhow::bail!("Unknown transaction type: {}", s),
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -360,57 +373,80 @@ fn process_csv<R: std::io::Read>(
     reader: R,
 ) -> anyhow::Result<std::collections::HashMap<u16, Account>> {
     let mut rdr = csv::ReaderBuilder::new()
-        .trim(csv::Trim::All)
+        .trim(csv::Trim::None)
         .from_reader(reader);
 
     let mut accounts: std::collections::HashMap<u16, Account> = std::collections::HashMap::new();
     let mut deposits: std::collections::HashMap<u32, Deposit> = std::collections::HashMap::new();
     let mut withdrawals: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
 
-    for (line_num, result) in rdr.deserialize().enumerate() {
+    for (line_num, result) in rdr.records().enumerate() {
         let line = line_num + 2; // +1 for 0-index, +1 for header
-        let record: TxRecord = result.with_context(|| format!("Failed to parse row {}", line))?;
+        let record = result.with_context(|| format!("Failed to parse row {}", line))?;
 
-        let tx = match record.kind {
+        let kind: TxKind = record
+            .get(COL_TYPE)
+            .with_context(|| format!("Missing type field at line {}", line))?
+            .trim()
+            .parse()
+            .with_context(|| format!("Invalid transaction type at line {}", line))?;
+        let client: u16 = record
+            .get(COL_CLIENT)
+            .with_context(|| format!("Missing client field at line {}", line))?
+            .trim()
+            .parse()
+            .with_context(|| format!("Invalid client ID at line {}", line))?;
+        let tx_id: u32 = record
+            .get(COL_TX)
+            .with_context(|| format!("Missing tx field at line {}", line))?
+            .trim()
+            .parse()
+            .with_context(|| format!("Invalid transaction ID at line {}", line))?;
+
+        let amount: Option<rust_decimal::Decimal> = {
+            let s = record.get(COL_AMOUNT).unwrap_or("").trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(
+                    s.parse()
+                        .with_context(|| format!("Invalid amount at line {}", line))?,
+                )
+            }
+        };
+
+        let tx = match kind {
             TxKind::Deposit => {
-                let amount_dec = record
-                    .amount
-                    .with_context(|| format!("Deposit missing amount at line {}", line))?;
+                let amount_dec =
+                    amount.with_context(|| format!("Deposit missing amount at line {}", line))?;
                 let amount = decimal_to_u64(amount_dec)
                     .with_context(|| format!("Invalid deposit amount at line {}", line))?;
                 Tx {
-                    account_id: record.client,
-                    action: TxAction::Deposit {
-                        tx_id: record.tx,
-                        amount,
-                    },
+                    account_id: client,
+                    action: TxAction::Deposit { tx_id, amount },
                 }
             }
             TxKind::Withdrawal => {
-                let amount_dec = record
-                    .amount
+                let amount_dec = amount
                     .with_context(|| format!("Withdrawal missing amount at line {}", line))?;
                 let amount = decimal_to_u64(amount_dec)
                     .with_context(|| format!("Invalid withdrawal amount at line {}", line))?;
                 Tx {
-                    account_id: record.client,
-                    action: TxAction::Withdrawal {
-                        tx_id: record.tx,
-                        amount,
-                    },
+                    account_id: client,
+                    action: TxAction::Withdrawal { tx_id, amount },
                 }
             }
             TxKind::Dispute => Tx {
-                account_id: record.client,
-                action: TxAction::Dispute { tx_id: record.tx },
+                account_id: client,
+                action: TxAction::Dispute { tx_id },
             },
             TxKind::Resolve => Tx {
-                account_id: record.client,
-                action: TxAction::Resolve { tx_id: record.tx },
+                account_id: client,
+                action: TxAction::Resolve { tx_id },
             },
             TxKind::Chargeback => Tx {
-                account_id: record.client,
-                action: TxAction::Chargeback { tx_id: record.tx },
+                account_id: client,
+                action: TxAction::Chargeback { tx_id },
             },
         };
 
