@@ -1,5 +1,6 @@
-use anyhow::Context;
+mod generator;
 
+use anyhow::Context;
 use rust_decimal::prelude::ToPrimitive;
 
 trait HashMapInsertUniqueExt<K, V> {
@@ -447,6 +448,37 @@ fn write_accounts_csv<W: std::io::Write>(
     Ok(())
 }
 
-fn main() {
-    println!("Hello, world!");
+fn print_usage() {
+    eprintln!("Usage:");
+    eprintln!("  cargo run <transactions.csv>    Process transactions file");
+    eprintln!("  cargo run generate <num_lines>  Generate test transactions");
+}
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("generate") => {
+            let num_lines: u32 = args
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow::anyhow!("generate requires a valid number of lines"))?;
+
+            generator::generate(num_lines);
+        }
+        Some(path) if std::path::Path::new(path).exists() => {
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("Failed to open CSV file: {}", path))?;
+            let accounts = process_csv(file)?;
+            write_accounts_csv(accounts, std::io::stdout())?
+        }
+        Some(arg) => {
+            anyhow::bail!("'{}' is not a valid file or command", arg);
+        }
+        None => {
+            print_usage();
+            anyhow::bail!("No arguments provided");
+        }
+    }
+    Ok(())
 }
